@@ -1,6 +1,6 @@
 {
   "name": "domino-server",
-  "version": "1.0.0",
+  "version": "3.0.0",
   "description": "خادم لعبة الدومينو للعب الجماعي عبر الإنترنت",
   "main": "server.js",
   "scripts": {
@@ -16,7 +16,8 @@
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
     "helmet": "^7.0.0",
-    "uuid": "^9.0.0"
+    "uuid": "^9.0.0",
+    "firebase-admin": "^12.0.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
