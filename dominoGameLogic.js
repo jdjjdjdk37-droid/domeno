@@ -1,11 +1,12 @@
 // ==============================================
 // محرك قواعد لعبة الدومينو الكلاسيكية
+// الإصدار 2.0 - محدّث مع lastActivity
 // ==============================================
 
 class DominoGame {
   constructor(roomId, mode, hostId, hostName) {
     this.roomId = roomId;
-    this.mode = mode; // "1v1" أو "2v2" أو "classic"
+    this.mode = mode || "classic"; // "1v1" أو "2v2" أو "classic"
     this.hostId = hostId;
     this.players = []; // [{id, name, hand, score, team, connected}]
     this.boneyard = []; // الرص
@@ -13,11 +14,12 @@ class DominoGame {
     this.leftEnd = null;  // الرقم على الطرف الأيسر
     this.rightEnd = null; // الرقم على الطرف الأيمن
     this.currentTurn = 0; // فهرس اللاعب الحالي
-    this.gameStatus = "waiting"; // waiting | playing | finished
+    this.gameStatus = "waiting"; // waiting | playing | round_finished | finished
     this.roundNumber = 0;
     this.maxScore = 100; // نقاط الفوز
     this.lastAction = null;
     this.createdAt = Date.now();
+    this.lastActivity = Date.now();  // ✅ للسيرفر: تتبع آخر نشاط
 
     // إضافة المضيف كلاعب أول
     this.addPlayer(hostId, hostName);
@@ -121,6 +123,8 @@ class DominoGame {
 
     this.currentTurn = startingPlayer;
     this.gameStatus = "playing";
+    this.lastActivity = Date.now(); // ✅ تحديث النشاط
+
     this.lastAction = {
       type: "round_start",
       player: this.players[startingPlayer].name,
@@ -212,6 +216,8 @@ class DominoGame {
       this.board.push(newTile);
     }
 
+    this.lastActivity = Date.now(); // ✅ تحديث النشاط
+
     this.lastAction = {
       type: "play",
       player: player.name,
@@ -242,6 +248,8 @@ class DominoGame {
     const tile = this.boneyard.pop();
     player.hand.push(tile);
 
+    this.lastActivity = Date.now(); // ✅ تحديث النشاط
+
     this.lastAction = {
       type: "draw",
       player: player.name,
@@ -266,6 +274,8 @@ class DominoGame {
     }
 
     const player = this.players[playerIndex];
+    this.lastActivity = Date.now(); // ✅ تحديث النشاط
+
     this.lastAction = {
       type: "pass",
       player: player.name,
@@ -321,6 +331,7 @@ class DominoGame {
     };
 
     this.gameStatus = "round_finished";
+    this.lastActivity = Date.now(); // ✅ تحديث النشاط
 
     // فحص إذا وصل لـ 100 نقطة (فوز اللعبة)
     if (winner.score >= this.maxScore) {
@@ -366,6 +377,7 @@ class DominoGame {
     };
 
     this.gameStatus = "round_finished";
+    this.lastActivity = Date.now(); // ✅ تحديث النشاط
 
     if (this.players[winnerIndex].score >= this.maxScore) {
       this.gameStatus = "finished";
