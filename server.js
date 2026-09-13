@@ -1,5 +1,6 @@
 // ==============================================
-// خادم لعبة الدومينو - Railway Ready v2.0
+// خادم لعبة الدومينو - Railway Ready v3.0
+// OTA معطّل مؤقتاً حتى رفع APK
 // ==============================================
 require('dotenv').config();
 const express = require('express');
@@ -10,6 +11,7 @@ const helmet = require('helmet');
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 const fs = require('fs');
+const admin = require('firebase-admin');
 const { DominoGame } = require('./dominoGameLogic');
 
 // =========================================
@@ -34,26 +36,57 @@ app.use(express.json());
 app.use('/downloads', express.static(path.join(__dirname, 'public/downloads')));
 
 // =========================================
-// تخزين الغرف في الذاكرة
+// 🔥 إعداد Firebase Admin
 // =========================================
-const rooms = new Map();      // roomId → DominoGame
-const playerRooms = new Map(); // socketId → roomId
+let db = null;
+let firebaseReady = false;
+
+try {
+  if (process.env.FIREBASE_PROJECT_ID && 
+      process.env.FIREBASE_CLIENT_EMAIL && 
+      process.env.FIREBASE_PRIVATE_KEY) {
+    
+    admin.initializeApp({
+      credential: admin.credential.cert({
+        projectId: process.env.FIREBASE_PROJECT_ID,
+        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+        privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+      }),
+    });
+    
+    db = admin.firestore();
+    firebaseReady = true;
+    console.log('✅ Firebase Admin جاهز');
+  } else {
+    console.log('⚠️ متغيرات Firebase غير مكتملة - ستعمل اللعبة بدون حفظ النتائج');
+  }
+} catch (err) {
+  console.error('❌ فشل تهيئة Firebase:', err.message);
+}
 
 // =========================================
-// معلومات الإصدار الحالي (للـ OTA)
+// تخزين الغرف في الذاكرة
 // =========================================
+const rooms = new Map();
+const playerRooms = new Map();
+
+// =========================================
+// ⏸️ OTA معطّل مؤقتاً
+// =========================================
+const OTA_ENABLED = false; // ← غيّرها إلى true عند رفع APK
+
 const LATEST_VERSION = {
   versionCode: 2,
   versionName: "2.1.0",
   apkUrl: `${process.env.PUBLIC_URL || 'https://domino-server-production-e9af.up.railway.app'}/downloads/domino-v2.1.0.apk`,
-  changelog: "🎉 الجديد:\n• تحسين إغلاق الغرف تلقائياً\n• إضافة مؤثرات صوتية\n• إصلاح أخطاء الاتصال\n• تحسين الأداء",
+  changelog: "🎉 الجديد:\n• تسجيل دخول\n• أصدقاء\n• دردشة\n• إشعارات",
   isMandatory: false,
   releaseDate: "2026-09-13",
   minSupportedVersion: 1,
 };
 
 // =========================================
-// 🔥 دالة تنظيف الغرفة (جديدة)
+// 🔥 إغلاق الغرفة
 // =========================================
 function closeRoom(roomId, reason = "انتهت اللعبة") {
   const game = rooms.get(roomId);
@@ -61,85 +94,76 @@ function closeRoom(roomId, reason = "انتهت اللعبة") {
 
   console.log(`🔒 إغلاق الغرفة ${roomId} - السبب: ${reason}`);
 
-  // إشعار اللاعبين
   io.to(roomId).emit('room_closed', {
     roomId,
     reason,
     message: reason
   });
 
-  // إزالة كل اللاعبين من الغرفة
   game.players.forEach(p => {
     playerRooms.delete(p.id);
   });
 
-  // إخراج جميع Sockets من الغرفة
   io.sockets.sockets.forEach(socket => {
     if (socket.rooms.has(roomId)) {
       socket.leave(roomId);
     }
   });
 
-  // حذف الغرفة
   rooms.delete(roomId);
   console.log(`🗑️ تم حذف الغرفة ${roomId} | الغرف المتبقية: ${rooms.size}`);
 }
 
 // =========================================
-// 🧹 فحص وإغلاق الغرف المهملة كل دقيقة
+// 🧹 تنظيف الغرف المهملة
 // =========================================
 setInterval(() => {
   const now = Date.now();
-  const MAX_IDLE_TIME = 10 * 60 * 1000; // 10 دقائق بدون نشاط
-  const MAX_GAME_AGE = 3 * 60 * 60 * 1000; // 3 ساعات كحد أقصى
+  const MAX_IDLE_TIME = 10 * 60 * 1000;
+  const MAX_GAME_AGE = 3 * 60 * 60 * 1000;
 
   rooms.forEach((game, roomId) => {
     const lastActivity = game.lastActivity || game.createdAt;
 
-    // غرفة لعبة منتهية
     if (game.gameStatus === "finished") {
       closeRoom(roomId, "🏆 انتهت اللعبة");
       return;
     }
 
-    // غرفة بلا نشاط
     if (now - lastActivity > MAX_IDLE_TIME) {
       closeRoom(roomId, "⏱️ انتهت مدة الانتظار");
       return;
     }
 
-    // غرفة قديمة جداً
     if (now - game.createdAt > MAX_GAME_AGE) {
       closeRoom(roomId, "⌛ الغرفة قديمة");
       return;
     }
 
-    // غرفة فارغة من اللاعبين المتصلين
     const connectedPlayers = game.players.filter(p => p.connected);
     if (connectedPlayers.length === 0) {
       closeRoom(roomId, "👋 غادر جميع اللاعبين");
     }
   });
-}, 60 * 1000); // كل دقيقة
+}, 60 * 1000);
 
 // =========================================
-// Endpoints
+// 🌐 Endpoints
 // =========================================
 
-// الصفحة الرئيسية
 app.get('/', (req, res) => {
   res.json({
     name: "🎲 Domino Server",
     status: "online",
-    version: "2.0.0",
+    version: "3.0.0",
     activeRooms: rooms.size,
     activePlayers: playerRooms.size,
     uptime: Math.floor(process.uptime()) + "s",
-    latestAppVersion: LATEST_VERSION.versionName,
+    otaEnabled: OTA_ENABLED,
+    firebaseReady: firebaseReady,
   });
 });
 
-// فحص الصحة
 app.get('/health', (req, res) => {
   res.status(200).json({
     status: "healthy",
@@ -148,10 +172,11 @@ app.get('/health', (req, res) => {
     players: playerRooms.size,
     memory: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + "MB",
     uptime: Math.floor(process.uptime()) + "s",
+    otaEnabled: OTA_ENABLED,
+    firebaseReady: firebaseReady,
   });
 });
 
-// قائمة الغرف المفتوحة
 app.get('/rooms', (req, res) => {
   const list = [];
   rooms.forEach((game, roomId) => {
@@ -170,35 +195,142 @@ app.get('/rooms', (req, res) => {
 });
 
 // =========================================
-// 🆕 OTA Update Endpoint
+// 🎯 OTA Endpoint (معطّل حالياً)
 // =========================================
 app.get('/api/check-update', (req, res) => {
-  const clientVersion = parseInt(req.query.versionCode) || 0;
-  const clientPlatform = req.query.platform || 'android';
-
-  console.log(`📱 فحص تحديث: platform=${clientPlatform} version=${clientVersion}`);
-
-  if (clientVersion < LATEST_VERSION.versionCode) {
-    return res.json({
-      updateAvailable: true,
-      versionCode: LATEST_VERSION.versionCode,
-      versionName: LATEST_VERSION.versionName,
-      apkUrl: LATEST_VERSION.apkUrl,
-      changelog: LATEST_VERSION.changelog,
-      isMandatory: clientVersion < LATEST_VERSION.minSupportedVersion,
-      releaseDate: LATEST_VERSION.releaseDate,
-      minSupportedVersion: LATEST_VERSION.minSupportedVersion,
+  // ⏸️ لو OTA معطّل → لا تحديث
+  if (!OTA_ENABLED) {
+    return res.json({ 
+      updateAvailable: false,
+      message: "لا يوجد تحديث حالياً"
     });
   }
 
+  const clientVersion = parseInt(req.query.versionCode) || 0;
+
+  // فحص وجود ملف APK
+  const apkPath = path.join(__dirname, 'public/downloads/domino-v2.1.0.apk');
+  const apkExists = fs.existsSync(apkPath);
+
+  // لو الملف غير موجود → لا تحديث
+  if (!apkExists) {
+    return res.json({ 
+      updateAvailable: false,
+      message: "لا يوجد ملف تحديث متاح حالياً"
+    });
+  }
+
+  // لو الإصدار محدّث
+  if (clientVersion >= LATEST_VERSION.versionCode) {
+    return res.json({
+      updateAvailable: false,
+      currentVersion: LATEST_VERSION.versionName,
+    });
+  }
+
+  // يوجد تحديث
+  console.log(`📱 فحص تحديث: version=${clientVersion}`);
   res.json({
-    updateAvailable: false,
-    currentVersion: LATEST_VERSION.versionName,
+    updateAvailable: true,
+    versionCode: LATEST_VERSION.versionCode,
+    versionName: LATEST_VERSION.versionName,
+    apkUrl: LATEST_VERSION.apkUrl,
+    changelog: LATEST_VERSION.changelog,
+    isMandatory: clientVersion < LATEST_VERSION.minSupportedVersion,
+    releaseDate: LATEST_VERSION.releaseDate,
+    minSupportedVersion: LATEST_VERSION.minSupportedVersion,
+    apkSize: fs.statSync(apkPath).size,
   });
 });
 
 // =========================================
-// WebSocket Events
+// 💾 دوال Firebase
+// =========================================
+async function saveMatch(matchData) {
+  if (!firebaseReady) return;
+  try {
+    await db.collection('matches').add({
+      ...matchData,
+      finishedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    console.log('✅ تم حفظ المباراة في Firestore');
+  } catch (err) {
+    console.error('❌ فشل حفظ المباراة:', err.message);
+  }
+}
+
+async function updateUserStats(playerName, won, score) {
+  if (!firebaseReady) return;
+  try {
+    const snapshot = await db.collection('users_stats')
+      .where('name', '==', playerName)
+      .limit(1)
+      .get();
+
+    if (snapshot.empty) {
+      // إنشاء وثيقة جديدة
+      await db.collection('users_stats').add({
+        name: playerName,
+        wins: won ? 1 : 0,
+        losses: won ? 0 : 1,
+        totalScore: score,
+        longestStreak: won ? 1 : 0,
+        currentStreak: won ? 1 : 0,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    } else {
+      const doc = snapshot.docs[0];
+      const data = doc.data();
+      const newStreak = won ? (data.currentStreak || 0) + 1 : 0;
+      
+      await doc.ref.update({
+        wins: (data.wins || 0) + (won ? 1 : 0),
+        losses: (data.losses || 0) + (won ? 0 : 1),
+        totalScore: (data.totalScore || 0) + score,
+        currentStreak: newStreak,
+        longestStreak: Math.max(data.longestStreak || 0, newStreak),
+        lastPlayed: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    }
+  } catch (err) {
+    console.error('❌ فشل تحديث الإحصائيات:', err.message);
+  }
+}
+
+async function updateLeaderboard() {
+  if (!firebaseReady) return;
+  try {
+    const snapshot = await db.collection('users_stats')
+      .orderBy('totalScore', 'desc')
+      .limit(100)
+      .get();
+
+    const batch = db.batch();
+    const leaderboardRef = db.collection('leaderboard');
+    
+    // حذف القديم
+    const oldSnapshot = await leaderboardRef.get();
+    oldSnapshot.docs.forEach(doc => batch.delete(doc.ref));
+    
+    // إضافة الجديد
+    snapshot.docs.forEach((doc, index) => {
+      const newRef = leaderboardRef.doc();
+      batch.set(newRef, {
+        rank: index + 1,
+        ...doc.data(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    });
+
+    await batch.commit();
+    console.log('✅ تم تحديث Leaderboard');
+  } catch (err) {
+    console.error('❌ فشل تحديث Leaderboard:', err.message);
+  }
+}
+
+// =========================================
+// 🔌 WebSocket Events
 // =========================================
 io.on('connection', (socket) => {
   console.log(`✅ لاعب متصل: ${socket.id} | إجمالي: ${io.engine.clientsCount}`);
@@ -286,7 +418,6 @@ io.on('connection', (socket) => {
       if (result.gameEnded) {
         io.to(roomId).emit('round_ended', game.lastAction);
         
-        // 🔥 إذا انتهت اللعبة الكاملة → أغلق الغرفة بعد 30 ثانية
         if (game.gameStatus === "finished") {
           const winner = game.players.find(p => p.score >= game.maxScore);
           io.to(roomId).emit('game_ended', {
@@ -294,8 +425,25 @@ io.on('connection', (socket) => {
             scores: game.players.map(p => ({ name: p.name, score: p.score })),
           });
           
-          // إغلاق الغرفة بعد 30 ثانية
-          setTimeout(() => closeRoom(roomId, "🏆 انتهت اللعبة الكاملة"), 30000);
+          // 💾 حفظ في Firestore
+          if (firebaseReady) {
+            saveMatch({
+              roomId,
+              mode: game.mode,
+              players: game.players.map(p => ({ name: p.name, score: p.score })),
+              winner: winner?.name,
+              duration: Date.now() - game.createdAt,
+              createdAt: new Date(game.createdAt).toISOString(),
+            });
+            
+            game.players.forEach(p => {
+              updateUserStats(p.name, p.id === winner?.id, p.score);
+            });
+            
+            updateLeaderboard();
+          }
+          
+          setTimeout(() => closeRoom(roomId, "🏆 انتهت اللعبة"), 30000);
         }
       }
 
@@ -342,15 +490,6 @@ io.on('connection', (socket) => {
 
       if (result.gameEnded) {
         io.to(roomId).emit('round_ended', game.lastAction);
-        
-        if (game.gameStatus === "finished") {
-          const winner = game.players.find(p => p.score >= game.maxScore);
-          io.to(roomId).emit('game_ended', {
-            winner: winner?.name,
-            scores: game.players.map(p => ({ name: p.name, score: p.score })),
-          });
-          setTimeout(() => closeRoom(roomId, "🏆 انتهت اللعبة"), 30000);
-        }
       }
 
       callback?.({ success: true });
@@ -379,12 +518,29 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 7. مغادرة يدوية
+  // 7. الدردشة
+  socket.on('send_message', ({ roomId, text, type = "text" }) => {
+    const game = rooms.get(roomId);
+    if (!game) return;
+
+    const player = game.players.find(p => p.id === socket.id);
+    if (!player) return;
+
+    io.to(roomId).emit('chat_message', {
+      playerId: socket.id,
+      playerName: player.name,
+      text: text.substring(0, 100),
+      type,
+      timestamp: Date.now(),
+    });
+  });
+
+  // 8. مغادرة
   socket.on('leave_room', ({ roomId }) => {
     handlePlayerLeave(socket, roomId);
   });
 
-  // 8. الانقطاع
+  // 9. الانقطاع
   socket.on('disconnect', () => {
     console.log(`❌ قطع اتصال: ${socket.id}`);
     const roomId = playerRooms.get(socket.id);
@@ -409,9 +565,6 @@ function handlePlayerLeave(socket, roomId) {
     message: "أحد اللاعبين غادر الغرفة",
   });
 
-  // 🔥 حذف الغرفة فوراً إذا:
-  // 1. فارغة تماماً
-  // 2. أو كل اللاعبين غير متصلين
   const connectedPlayers = game.players.filter(p => p.connected);
   
   if (game.isEmpty() || connectedPlayers.length === 0) {
@@ -426,11 +579,12 @@ const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`
   ╔═══════════════════════════════════════╗
-  ║   🎲 Domino Server v2.0 is Running!  ║
+  ║   🎲 Domino Server v3.0              ║
   ║   Port: ${PORT}                          ║
   ║   Status: ✅ Ready                    ║
-  ║   OTA: ✅ Enabled                     ║
-  ║   Auto-Clean: ✅ Enabled              ║
+  ║   Firebase: ${firebaseReady ? '✅' : '⚠️'}                      ║
+  ║   OTA: ${OTA_ENABLED ? '✅ مفعّل' : '⏸️ معطّل'}                    ║
+  ║   Auto-Clean: ✅ مفعّل                ║
   ╚═══════════════════════════════════════╝
   `);
 });
