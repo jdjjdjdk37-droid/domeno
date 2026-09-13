@@ -1,6 +1,6 @@
 // ==============================================
-// خادم لعبة الدومينو - Railway Ready v3.0
-// OTA معطّل مؤقتاً حتى رفع APK
+// خادم لعبة الدومينو - Railway Ready v3.1
+// + رفع الصور عبر Firebase Storage
 // ==============================================
 require('dotenv').config();
 const express = require('express');
@@ -11,6 +11,7 @@ const helmet = require('helmet');
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 const fs = require('fs');
+const multer = require('multer');
 const admin = require('firebase-admin');
 const { DominoGame } = require('./dominoGameLogic');
 
@@ -30,15 +31,16 @@ const io = new Server(server, {
 
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 // خدمة ملفات APK الثابتة
 app.use('/downloads', express.static(path.join(__dirname, 'public/downloads')));
 
 // =========================================
-// 🔥 إعداد Firebase Admin
+// 🔥 إعداد Firebase Admin (Firestore + Storage)
 // =========================================
 let db = null;
+let bucket = null;
 let firebaseReady = false;
 
 try {
@@ -52,17 +54,37 @@ try {
         clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
         privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
       }),
+      storageBucket: process.env.FIREBASE_STORAGE_BUCKET || 
+                     `${process.env.FIREBASE_PROJECT_ID}.appspot.com`,
     });
     
     db = admin.firestore();
+    bucket = admin.storage().bucket();
     firebaseReady = true;
-    console.log('✅ Firebase Admin جاهز');
+    console.log('✅ Firebase Admin جاهز (Firestore + Storage)');
+    console.log(`🪣 Storage Bucket: ${bucket.name}`);
   } else {
-    console.log('⚠️ متغيرات Firebase غير مكتملة - ستعمل اللعبة بدون حفظ النتائج');
+    console.log('⚠️ متغيرات Firebase غير مكتملة - ستعمل اللعبة بدون حفظ النتائج أو رفع الصور');
   }
 } catch (err) {
   console.error('❌ فشل تهيئة Firebase:', err.message);
 }
+
+// =========================================
+// 📸 إعداد multer للرفع في الذاكرة
+// =========================================
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5 ميجا
+  fileFilter: (req, file, cb) => {
+    const allowed = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+    if (allowed.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('نوع الصورة غير مدعوم'));
+    }
+  },
+});
 
 // =========================================
 // تخزين الغرف في الذاكرة
@@ -73,7 +95,7 @@ const playerRooms = new Map();
 // =========================================
 // ⏸️ OTA معطّل مؤقتاً
 // =========================================
-const OTA_ENABLED = false; // ← غيّرها إلى true عند رفع APK
+const OTA_ENABLED = false;
 
 const LATEST_VERSION = {
   versionCode: 2,
@@ -155,12 +177,13 @@ app.get('/', (req, res) => {
   res.json({
     name: "🎲 Domino Server",
     status: "online",
-    version: "3.0.0",
+    version: "3.1.0",
     activeRooms: rooms.size,
     activePlayers: playerRooms.size,
     uptime: Math.floor(process.uptime()) + "s",
     otaEnabled: OTA_ENABLED,
     firebaseReady: firebaseReady,
+    storageReady: !!bucket,
   });
 });
 
@@ -174,6 +197,7 @@ app.get('/health', (req, res) => {
     uptime: Math.floor(process.uptime()) + "s",
     otaEnabled: OTA_ENABLED,
     firebaseReady: firebaseReady,
+    storageReady: !!bucket,
   });
 });
 
@@ -195,10 +219,149 @@ app.get('/rooms', (req, res) => {
 });
 
 // =========================================
+// 📸 رفع الصور - Endpoints جديدة
+// =========================================
+
+// رفع صورة عامة (صورة اللاعب، الخلفية، إلخ)
+app.post('/api/upload', upload.single('image'), async (req, res) => {
+  if (!bucket) {
+    return res.status(503).json({ 
+      success: false, 
+      error: "خدمة تخزين الصور غير مفعّلة (Firebase Storage غير مهيأ)" 
+    });
+  }
+
+  if (!req.file) {
+    return res.status(400).json({ success: false, error: "لم يتم إرسال أي صورة" });
+  }
+
+  try {
+    const folder = (req.body.folder || 'general').replace(/[^a-zA-Z0-9_-]/g, '');
+    const ext = req.file.mimetype.split('/')[1];
+    const fileName = `uploads/${folder}/${Date.now()}-${uuidv4()}.${ext}`;
+    const file = bucket.file(fileName);
+
+    await file.save(req.file.buffer, {
+      metadata: {
+        contentType: req.file.mimetype,
+        cacheControl: 'public, max-age=31536000',
+      },
+      resumable: false,
+      public: true,
+    });
+
+    const publicUrl = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
+
+    console.log(`📸 تم رفع صورة: ${fileName} (${req.file.size} bytes)`);
+
+    res.json({
+      success: true,
+      url: publicUrl,
+      fileName,
+      size: req.file.size,
+      mimeType: req.file.mimetype,
+    });
+  } catch (err) {
+    console.error('❌ فشل رفع الصورة:', err.message);
+    res.status(500).json({ success: false, error: "فشل رفع الصورة: " + err.message });
+  }
+});
+
+// رفع صورة شخصية للاعب (avatar)
+app.post('/api/upload-avatar', upload.single('image'), async (req, res) => {
+  if (!bucket) {
+    return res.status(503).json({ 
+      success: false, 
+      error: "خدمة تخزين الصور غير مفعّلة" 
+    });
+  }
+
+  if (!req.file) {
+    return res.status(400).json({ success: false, error: "لم يتم إرسال صورة" });
+  }
+
+  const playerName = (req.body.playerName || 'guest').replace(/[^a-zA-Z0-9_\u0600-\u06FF]/g, '');
+
+  try {
+    const ext = req.file.mimetype.split('/')[1];
+    const fileName = `avatars/${playerName}-${Date.now()}.${ext}`;
+    const file = bucket.file(fileName);
+
+    await file.save(req.file.buffer, {
+      metadata: {
+        contentType: req.file.mimetype,
+        cacheControl: 'public, max-age=31536000',
+      },
+      resumable: false,
+      public: true,
+    });
+
+    const publicUrl = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
+
+    // حفظ الرابط في Firestore إذا كان متاحاً
+    if (db) {
+      try {
+        const snapshot = await db.collection('users_stats')
+          .where('name', '==', playerName)
+          .limit(1)
+          .get();
+
+        if (!snapshot.empty) {
+          await snapshot.docs[0].ref.update({ 
+            avatarUrl: publicUrl,
+            avatarUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+        } else {
+          await db.collection('users_stats').add({
+            name: playerName,
+            avatarUrl: publicUrl,
+            wins: 0,
+            losses: 0,
+            totalScore: 0,
+            longestStreak: 0,
+            currentStreak: 0,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+        }
+      } catch (dbErr) {
+        console.error('⚠️ فشل تحديث Firestore:', dbErr.message);
+      }
+    }
+
+    console.log(`🖼️ تم رفع صورة شخصية: ${playerName} → ${publicUrl}`);
+
+    res.json({
+      success: true,
+      url: publicUrl,
+      playerName,
+    });
+  } catch (err) {
+    console.error('❌ فشل رفع الصورة الشخصية:', err.message);
+    res.status(500).json({ success: false, error: "فشل رفع الصورة" });
+  }
+});
+
+// حذف صورة (اختياري - للحماية)
+app.delete('/api/delete-image', async (req, res) => {
+  if (!bucket) return res.status(503).json({ error: "غير مفعّل" });
+  
+  const { fileName } = req.body;
+  if (!fileName || !fileName.startsWith('uploads/') && !fileName.startsWith('avatars/')) {
+    return res.status(400).json({ error: "اسم ملف غير صالح" });
+  }
+
+  try {
+    await bucket.file(fileName).delete();
+    res.json({ success: true, message: "تم حذف الصورة" });
+  } catch (err) {
+    res.status(500).json({ error: "فشل الحذف: " + err.message });
+  }
+});
+
+// =========================================
 // 🎯 OTA Endpoint (معطّل حالياً)
 // =========================================
 app.get('/api/check-update', (req, res) => {
-  // ⏸️ لو OTA معطّل → لا تحديث
   if (!OTA_ENABLED) {
     return res.json({ 
       updateAvailable: false,
@@ -207,12 +370,9 @@ app.get('/api/check-update', (req, res) => {
   }
 
   const clientVersion = parseInt(req.query.versionCode) || 0;
-
-  // فحص وجود ملف APK
   const apkPath = path.join(__dirname, 'public/downloads/domino-v2.1.0.apk');
   const apkExists = fs.existsSync(apkPath);
 
-  // لو الملف غير موجود → لا تحديث
   if (!apkExists) {
     return res.json({ 
       updateAvailable: false,
@@ -220,7 +380,6 @@ app.get('/api/check-update', (req, res) => {
     });
   }
 
-  // لو الإصدار محدّث
   if (clientVersion >= LATEST_VERSION.versionCode) {
     return res.json({
       updateAvailable: false,
@@ -228,7 +387,6 @@ app.get('/api/check-update', (req, res) => {
     });
   }
 
-  // يوجد تحديث
   console.log(`📱 فحص تحديث: version=${clientVersion}`);
   res.json({
     updateAvailable: true,
@@ -268,7 +426,6 @@ async function updateUserStats(playerName, won, score) {
       .get();
 
     if (snapshot.empty) {
-      // إنشاء وثيقة جديدة
       await db.collection('users_stats').add({
         name: playerName,
         wins: won ? 1 : 0,
@@ -308,11 +465,9 @@ async function updateLeaderboard() {
     const batch = db.batch();
     const leaderboardRef = db.collection('leaderboard');
     
-    // حذف القديم
     const oldSnapshot = await leaderboardRef.get();
     oldSnapshot.docs.forEach(doc => batch.delete(doc.ref));
     
-    // إضافة الجديد
     snapshot.docs.forEach((doc, index) => {
       const newRef = leaderboardRef.doc();
       batch.set(newRef, {
@@ -335,7 +490,6 @@ async function updateLeaderboard() {
 io.on('connection', (socket) => {
   console.log(`✅ لاعب متصل: ${socket.id} | إجمالي: ${io.engine.clientsCount}`);
 
-  // 1. إنشاء غرفة
   socket.on('create_room', ({ playerName, mode = "1v1" }, callback) => {
     try {
       const roomId = uuidv4().slice(0, 6).toUpperCase();
@@ -359,7 +513,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 2. الانضمام
   socket.on('join_room', ({ roomId, playerName }, callback) => {
     try {
       const game = rooms.get(roomId.toUpperCase());
@@ -401,7 +554,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 3. لعب قطعة
   socket.on('play_tile', ({ roomId, tile, side }, callback) => {
     try {
       const game = rooms.get(roomId);
@@ -425,7 +577,6 @@ io.on('connection', (socket) => {
             scores: game.players.map(p => ({ name: p.name, score: p.score })),
           });
           
-          // 💾 حفظ في Firestore
           if (firebaseReady) {
             saveMatch({
               roomId,
@@ -454,7 +605,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 4. سحب قطعة
   socket.on('draw_tile', ({ roomId }, callback) => {
     try {
       const game = rooms.get(roomId);
@@ -474,7 +624,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 5. تمرير الدور
   socket.on('pass_turn', ({ roomId }, callback) => {
     try {
       const game = rooms.get(roomId);
@@ -498,7 +647,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 6. جولة جديدة
   socket.on('new_round', ({ roomId }, callback) => {
     try {
       const game = rooms.get(roomId);
@@ -518,7 +666,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 7. الدردشة
   socket.on('send_message', ({ roomId, text, type = "text" }) => {
     const game = rooms.get(roomId);
     if (!game) return;
@@ -535,12 +682,10 @@ io.on('connection', (socket) => {
     });
   });
 
-  // 8. مغادرة
   socket.on('leave_room', ({ roomId }) => {
     handlePlayerLeave(socket, roomId);
   });
 
-  // 9. الانقطاع
   socket.on('disconnect', () => {
     console.log(`❌ قطع اتصال: ${socket.id}`);
     const roomId = playerRooms.get(socket.id);
@@ -579,10 +724,11 @@ const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`
   ╔═══════════════════════════════════════╗
-  ║   🎲 Domino Server v3.0              ║
+  ║   🎲 Domino Server v3.1              ║
   ║   Port: ${PORT}                          ║
   ║   Status: ✅ Ready                    ║
   ║   Firebase: ${firebaseReady ? '✅' : '⚠️'}                      ║
+  ║   Storage: ${bucket ? '✅' : '⚠️'}                       ║
   ║   OTA: ${OTA_ENABLED ? '✅ مفعّل' : '⏸️ معطّل'}                    ║
   ║   Auto-Clean: ✅ مفعّل                ║
   ╚═══════════════════════════════════════╝
