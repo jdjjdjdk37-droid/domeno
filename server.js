@@ -1,6 +1,6 @@
 // ==============================================
-// خادم لعبة الدومينو - Railway Ready v3.1
-// + رفع الصور عبر Firebase Storage
+// خادم لعبة الدومينو - Railway Ready v5.0
+// مع Agora (مكالمات صوتية) + Firebase + AI Fallback
 // ==============================================
 require('dotenv').config();
 const express = require('express');
@@ -11,9 +11,45 @@ const helmet = require('helmet');
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 const fs = require('fs');
-const multer = require('multer');
-const admin = require('firebase-admin');
+const { RtcTokenBuilder, RtcRole } = require('agora-access-token');
+
+// استيراد Firebase
+let admin = null;
+let db = null;
+let firebaseReady = false;
+
+try {
+  admin = require('firebase-admin');
+  if (process.env.FIREBASE_PROJECT_ID && 
+      process.env.FIREBASE_CLIENT_EMAIL && 
+      process.env.FIREBASE_PRIVATE_KEY) {
+    
+    admin.initializeApp({
+      credential: admin.credential.cert({
+        projectId: process.env.FIREBASE_PROJECT_ID,
+        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+        privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+      }),
+    });
+    
+    db = admin.firestore();
+    firebaseReady = true;
+    console.log('✅ Firebase Admin جاهز');
+  }
+} catch (err) {
+  console.error('⚠️ Firebase معطّل:', err.message);
+}
+
+// استيراد منطق اللعبة
 const { DominoGame } = require('./dominoGameLogic');
+
+// =========================================
+// Agora Configuration
+// =========================================
+const AGORA_APP_ID = process.env.AGORA_APP_ID || "d25d8dee0f8b487fb15bb4151a54057d";
+const AGORA_APP_CERTIFICATE = process.env.AGORA_APP_CERTIFICATE || "f245fe7746ff4591b303bf9799bb7968";
+
+console.log(`🎤 Agora App ID: ${AGORA_APP_ID.substring(0, 8)}...`);
 
 // =========================================
 // إعداد التطبيق
@@ -31,81 +67,74 @@ const io = new Server(server, {
 
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json());
 
-// خدمة ملفات APK الثابتة
+// خدمة ملفات APK
 app.use('/downloads', express.static(path.join(__dirname, 'public/downloads')));
 
 // =========================================
-// 🔥 إعداد Firebase Admin (Firestore + Storage)
-// =========================================
-let db = null;
-let bucket = null;
-let firebaseReady = false;
-
-try {
-  if (process.env.FIREBASE_PROJECT_ID && 
-      process.env.FIREBASE_CLIENT_EMAIL && 
-      process.env.FIREBASE_PRIVATE_KEY) {
-    
-    admin.initializeApp({
-      credential: admin.credential.cert({
-        projectId: process.env.FIREBASE_PROJECT_ID,
-        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-        privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
-      }),
-      storageBucket: process.env.FIREBASE_STORAGE_BUCKET || 
-                     `${process.env.FIREBASE_PROJECT_ID}.appspot.com`,
-    });
-    
-    db = admin.firestore();
-    bucket = admin.storage().bucket();
-    firebaseReady = true;
-    console.log('✅ Firebase Admin جاهز (Firestore + Storage)');
-    console.log(`🪣 Storage Bucket: ${bucket.name}`);
-  } else {
-    console.log('⚠️ متغيرات Firebase غير مكتملة - ستعمل اللعبة بدون حفظ النتائج أو رفع الصور');
-  }
-} catch (err) {
-  console.error('❌ فشل تهيئة Firebase:', err.message);
-}
-
-// =========================================
-// 📸 إعداد multer للرفع في الذاكرة
-// =========================================
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5 ميجا
-  fileFilter: (req, file, cb) => {
-    const allowed = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
-    if (allowed.includes(file.mimetype)) {
-      cb(null, true);
-    } else {
-      cb(new Error('نوع الصورة غير مدعوم'));
-    }
-  },
-});
-
-// =========================================
-// تخزين الغرف في الذاكرة
+// تخزين الغرف
 // =========================================
 const rooms = new Map();
 const playerRooms = new Map();
 
-// =========================================
-// ⏸️ OTA معطّل مؤقتاً
-// =========================================
+// إعدادات
+const AI_TAKEOVER_DELAY = 30000;
+const TURN_TIMEOUT = 30000;
+
+// OTA
 const OTA_ENABLED = false;
 
 const LATEST_VERSION = {
-  versionCode: 2,
-  versionName: "2.1.0",
-  apkUrl: `${process.env.PUBLIC_URL || 'https://domino-server-production-e9af.up.railway.app'}/downloads/domino-v2.1.0.apk`,
-  changelog: "🎉 الجديد:\n• تسجيل دخول\n• أصدقاء\n• دردشة\n• إشعارات",
+  versionCode: 3,
+  versionName: "2.3.0",
+  apkUrl: `${process.env.PUBLIC_URL || 'https://domino-server-production-e9af.up.railway.app'}/downloads/domino-v2.3.0.apk`,
+  changelog: "🎉 جديد:\n• مكالمات صوتية (Agora)\n• إصلاح عرض القطع\n• تحسين الثيم",
   isMandatory: false,
-  releaseDate: "2026-09-13",
+  releaseDate: "2026-09-14",
   minSupportedVersion: 1,
 };
+
+// =========================================
+// 🎤 Agora Token Generator
+// =========================================
+app.post('/api/agora/token', (req, res) => {
+  try {
+    const { roomId, uid } = req.body;
+    
+    if (!roomId || !uid) {
+      return res.status(400).json({ error: "roomId و uid مطلوبان" });
+    }
+
+    const channelName = roomId;
+    const role = RtcRole.PUBLISHER;
+    const expirationTimeInSeconds = 3600;
+    const currentTimestamp = Math.floor(Date.now() / 1000);
+    const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
+
+    const token = RtcTokenBuilder.buildTokenWithUid(
+      AGORA_APP_ID,
+      AGORA_APP_CERTIFICATE,
+      channelName,
+      parseInt(uid),
+      role,
+      privilegeExpiredTs
+    );
+
+    console.log(`🎤 Token Agora → Room: ${roomId}, UID: ${uid}`);
+
+    res.json({
+      token,
+      channel: channelName,
+      uid: parseInt(uid),
+      appId: AGORA_APP_ID,
+      expiresAt: privilegeExpiredTs,
+    });
+  } catch (err) {
+    console.error('❌ فشل توليد Token:', err.message);
+    res.status(500).json({ error: "فشل توليد Token" });
+  }
+});
 
 // =========================================
 // 🔥 إغلاق الغرفة
@@ -115,6 +144,11 @@ function closeRoom(roomId, reason = "انتهت اللعبة") {
   if (!game) return;
 
   console.log(`🔒 إغلاق الغرفة ${roomId} - السبب: ${reason}`);
+
+  game.players.forEach(p => {
+    if (p.turnTimer) clearTimeout(p.turnTimer);
+    if (p.aiTakeoverTimer) clearTimeout(p.aiTakeoverTimer);
+  });
 
   io.to(roomId).emit('room_closed', {
     roomId,
@@ -133,7 +167,7 @@ function closeRoom(roomId, reason = "انتهت اللعبة") {
   });
 
   rooms.delete(roomId);
-  console.log(`🗑️ تم حذف الغرفة ${roomId} | الغرف المتبقية: ${rooms.size}`);
+  console.log(`🗑️ تم حذف الغرفة ${roomId}`);
 }
 
 // =========================================
@@ -163,27 +197,28 @@ setInterval(() => {
     }
 
     const connectedPlayers = game.players.filter(p => p.connected);
-    if (connectedPlayers.length === 0) {
+    if (connectedPlayers.length === 0 && game.players.length > 0) {
       closeRoom(roomId, "👋 غادر جميع اللاعبين");
     }
   });
 }, 60 * 1000);
 
 // =========================================
-// 🌐 Endpoints
+// 🎯 Endpoints
 // =========================================
 
 app.get('/', (req, res) => {
   res.json({
     name: "🎲 Domino Server",
     status: "online",
-    version: "3.1.0",
+    version: "5.0.0",
     activeRooms: rooms.size,
     activePlayers: playerRooms.size,
     uptime: Math.floor(process.uptime()) + "s",
     otaEnabled: OTA_ENABLED,
     firebaseReady: firebaseReady,
-    storageReady: !!bucket,
+    aiFallbackEnabled: true,
+    agoraEnabled: true,
   });
 });
 
@@ -197,7 +232,7 @@ app.get('/health', (req, res) => {
     uptime: Math.floor(process.uptime()) + "s",
     otaEnabled: OTA_ENABLED,
     firebaseReady: firebaseReady,
-    storageReady: !!bucket,
+    agoraEnabled: true,
   });
 });
 
@@ -211,7 +246,6 @@ app.get('/rooms', (req, res) => {
         players: game.players.length,
         maxPlayers: game.mode === "2v2" ? 4 : 2,
         hostName: game.players[0]?.name,
-        createdAt: game.createdAt,
       });
     }
   });
@@ -219,147 +253,41 @@ app.get('/rooms', (req, res) => {
 });
 
 // =========================================
-// 📸 رفع الصور - Endpoints جديدة
+// 📡 Config
 // =========================================
-
-// رفع صورة عامة (صورة اللاعب، الخلفية، إلخ)
-app.post('/api/upload', upload.single('image'), async (req, res) => {
-  if (!bucket) {
-    return res.status(503).json({ 
-      success: false, 
-      error: "خدمة تخزين الصور غير مفعّلة (Firebase Storage غير مهيأ)" 
-    });
-  }
-
-  if (!req.file) {
-    return res.status(400).json({ success: false, error: "لم يتم إرسال أي صورة" });
-  }
-
-  try {
-    const folder = (req.body.folder || 'general').replace(/[^a-zA-Z0-9_-]/g, '');
-    const ext = req.file.mimetype.split('/')[1];
-    const fileName = `uploads/${folder}/${Date.now()}-${uuidv4()}.${ext}`;
-    const file = bucket.file(fileName);
-
-    await file.save(req.file.buffer, {
-      metadata: {
-        contentType: req.file.mimetype,
-        cacheControl: 'public, max-age=31536000',
-      },
-      resumable: false,
-      public: true,
-    });
-
-    const publicUrl = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
-
-    console.log(`📸 تم رفع صورة: ${fileName} (${req.file.size} bytes)`);
-
-    res.json({
-      success: true,
-      url: publicUrl,
-      fileName,
-      size: req.file.size,
-      mimeType: req.file.mimetype,
-    });
-  } catch (err) {
-    console.error('❌ فشل رفع الصورة:', err.message);
-    res.status(500).json({ success: false, error: "فشل رفع الصورة: " + err.message });
-  }
-});
-
-// رفع صورة شخصية للاعب (avatar)
-app.post('/api/upload-avatar', upload.single('image'), async (req, res) => {
-  if (!bucket) {
-    return res.status(503).json({ 
-      success: false, 
-      error: "خدمة تخزين الصور غير مفعّلة" 
-    });
-  }
-
-  if (!req.file) {
-    return res.status(400).json({ success: false, error: "لم يتم إرسال صورة" });
-  }
-
-  const playerName = (req.body.playerName || 'guest').replace(/[^a-zA-Z0-9_\u0600-\u06FF]/g, '');
-
-  try {
-    const ext = req.file.mimetype.split('/')[1];
-    const fileName = `avatars/${playerName}-${Date.now()}.${ext}`;
-    const file = bucket.file(fileName);
-
-    await file.save(req.file.buffer, {
-      metadata: {
-        contentType: req.file.mimetype,
-        cacheControl: 'public, max-age=31536000',
-      },
-      resumable: false,
-      public: true,
-    });
-
-    const publicUrl = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
-
-    // حفظ الرابط في Firestore إذا كان متاحاً
-    if (db) {
-      try {
-        const snapshot = await db.collection('users_stats')
-          .where('name', '==', playerName)
-          .limit(1)
-          .get();
-
-        if (!snapshot.empty) {
-          await snapshot.docs[0].ref.update({ 
-            avatarUrl: publicUrl,
-            avatarUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
-        } else {
-          await db.collection('users_stats').add({
-            name: playerName,
-            avatarUrl: publicUrl,
-            wins: 0,
-            losses: 0,
-            totalScore: 0,
-            longestStreak: 0,
-            currentStreak: 0,
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
-        }
-      } catch (dbErr) {
-        console.error('⚠️ فشل تحديث Firestore:', dbErr.message);
-      }
-    }
-
-    console.log(`🖼️ تم رفع صورة شخصية: ${playerName} → ${publicUrl}`);
-
-    res.json({
-      success: true,
-      url: publicUrl,
-      playerName,
-    });
-  } catch (err) {
-    console.error('❌ فشل رفع الصورة الشخصية:', err.message);
-    res.status(500).json({ success: false, error: "فشل رفع الصورة" });
-  }
-});
-
-// حذف صورة (اختياري - للحماية)
-app.delete('/api/delete-image', async (req, res) => {
-  if (!bucket) return res.status(503).json({ error: "غير مفعّل" });
-  
-  const { fileName } = req.body;
-  if (!fileName || !fileName.startsWith('uploads/') && !fileName.startsWith('avatars/')) {
-    return res.status(400).json({ error: "اسم ملف غير صالح" });
-  }
-
-  try {
-    await bucket.file(fileName).delete();
-    res.json({ success: true, message: "تم حذف الصورة" });
-  } catch (err) {
-    res.status(500).json({ error: "فشل الحذف: " + err.message });
-  }
+app.get('/api/config', (req, res) => {
+  res.json({
+    theme: {
+      primaryColor: "#0D2818",
+      accentColor: "#D4AF37",
+      surfaceColor: "#1A3A2A",
+      textColor: "#F5F0E1",
+    },
+    features: {
+      voiceChat: true,
+      aiTakeover: true,
+      avatars: true,
+      chat: true,
+      leaderboard: true,
+    },
+    agora: {
+      appId: AGORA_APP_ID,
+      enabled: true,
+    },
+    timings: {
+      turnTimeout: 30,
+      aiTakeoverDelay: 30,
+      roomIdleTimeout: 600,
+    },
+    version: {
+      latest: LATEST_VERSION.versionName,
+      code: LATEST_VERSION.versionCode,
+    },
+  });
 });
 
 // =========================================
-// 🎯 OTA Endpoint (معطّل حالياً)
+// 🔄 OTA
 // =========================================
 app.get('/api/check-update', (req, res) => {
   if (!OTA_ENABLED) {
@@ -370,39 +298,25 @@ app.get('/api/check-update', (req, res) => {
   }
 
   const clientVersion = parseInt(req.query.versionCode) || 0;
-  const apkPath = path.join(__dirname, 'public/downloads/domino-v2.1.0.apk');
-  const apkExists = fs.existsSync(apkPath);
+  const apkPath = path.join(__dirname, 'public/downloads/domino-v2.3.0.apk');
 
-  if (!apkExists) {
-    return res.json({ 
-      updateAvailable: false,
-      message: "لا يوجد ملف تحديث متاح حالياً"
-    });
+  if (!fs.existsSync(apkPath)) {
+    return res.json({ updateAvailable: false });
   }
 
   if (clientVersion >= LATEST_VERSION.versionCode) {
-    return res.json({
-      updateAvailable: false,
-      currentVersion: LATEST_VERSION.versionName,
-    });
+    return res.json({ updateAvailable: false });
   }
 
-  console.log(`📱 فحص تحديث: version=${clientVersion}`);
   res.json({
     updateAvailable: true,
-    versionCode: LATEST_VERSION.versionCode,
-    versionName: LATEST_VERSION.versionName,
-    apkUrl: LATEST_VERSION.apkUrl,
-    changelog: LATEST_VERSION.changelog,
-    isMandatory: clientVersion < LATEST_VERSION.minSupportedVersion,
-    releaseDate: LATEST_VERSION.releaseDate,
-    minSupportedVersion: LATEST_VERSION.minSupportedVersion,
+    ...LATEST_VERSION,
     apkSize: fs.statSync(apkPath).size,
   });
 });
 
 // =========================================
-// 💾 دوال Firebase
+// 💾 Firebase دوال
 // =========================================
 async function saveMatch(matchData) {
   if (!firebaseReady) return;
@@ -411,9 +325,8 @@ async function saveMatch(matchData) {
       ...matchData,
       finishedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
-    console.log('✅ تم حفظ المباراة في Firestore');
   } catch (err) {
-    console.error('❌ فشل حفظ المباراة:', err.message);
+    console.error('❌ حفظ المباراة:', err.message);
   }
 }
 
@@ -450,7 +363,7 @@ async function updateUserStats(playerName, won, score) {
       });
     }
   } catch (err) {
-    console.error('❌ فشل تحديث الإحصائيات:', err.message);
+    console.error('❌ تحديث الإحصائيات:', err.message);
   }
 }
 
@@ -478,17 +391,179 @@ async function updateLeaderboard() {
     });
 
     await batch.commit();
-    console.log('✅ تم تحديث Leaderboard');
   } catch (err) {
-    console.error('❌ فشل تحديث Leaderboard:', err.message);
+    console.error('❌ Leaderboard:', err.message);
   }
 }
 
 // =========================================
-// 🔌 WebSocket Events
+// 🤖 AI
+// =========================================
+function getAIMove(game, player) {
+  if (!game || !player) return null;
+
+  const validMoves = [];
+  
+  player.hand.forEach(tile => {
+    if (game.canPlayTile(tile, "left")) {
+      validMoves.push({ tile, side: "left" });
+    }
+    if (game.canPlayTile(tile, "right")) {
+      validMoves.push({ tile, side: "right" });
+    }
+  });
+
+  if (validMoves.length === 0) return null;
+
+  validMoves.sort((a, b) => {
+    const aDouble = a.tile.left === a.tile.right ? 1 : 0;
+    const bDouble = b.tile.left === b.tile.right ? 1 : 0;
+    if (aDouble !== bDouble) return bDouble - aDouble;
+    return (b.tile.left + b.tile.right) - (a.tile.left + a.tile.right);
+  });
+
+  return validMoves[0];
+}
+
+function startAIFallback(roomId, playerId) {
+  const game = rooms.get(roomId);
+  if (!game) return;
+
+  const player = game.players.find(p => p.id === playerId);
+  if (!player) return;
+
+  console.log(`🤖 AI يبدأ لعب ${player.name}`);
+  player.aiControlled = true;
+  
+  io.to(roomId).emit('ai_took_over', {
+    playerId,
+    playerName: player.name,
+    message: `🤖 AI يلعب مكان ${player.name}`,
+  });
+
+  if (game.players[game.currentTurn]?.id === playerId) {
+    makeAIMove(roomId, playerId);
+  }
+}
+
+function stopAIFallback(roomId, playerId) {
+  const game = rooms.get(roomId);
+  if (!game) return;
+
+  const player = game.players.find(p => p.id === playerId);
+  if (!player) return;
+
+  if (player.aiControlled) {
+    player.aiControlled = false;
+    io.to(roomId).emit('ai_stopped', {
+      playerId,
+      playerName: player.name,
+    });
+  }
+
+  if (player.aiTakeoverTimer) {
+    clearTimeout(player.aiTakeoverTimer);
+    player.aiTakeoverTimer = null;
+  }
+}
+
+function makeAIMove(roomId, playerId) {
+  const game = rooms.get(roomId);
+  if (!game || game.gameStatus !== "playing") return;
+
+  const player = game.players.find(p => p.id === playerId);
+  if (!player || !player.aiControlled) return;
+
+  if (game.players[game.currentTurn]?.id !== playerId) return;
+
+  const move = getAIMove(game, player);
+  
+  if (move) {
+    const result = game.playTile(playerId, move.tile, move.side);
+    
+    if (!result.error) {
+      game.players.forEach(p => {
+        io.to(p.id).emit('game_state', game.getPublicState(p.id));
+      });
+
+      if (result.gameEnded) {
+        io.to(roomId).emit('round_ended', game.lastAction);
+        if (game.gameStatus === "finished") {
+          handleGameEnd(roomId);
+        }
+      }
+    }
+  } else {
+    if (game.boneyard.length > 0) {
+      game.drawTile(playerId);
+      const newMove = getAIMove(game, player);
+      if (newMove) {
+        setTimeout(() => makeAIMove(roomId, playerId), 500);
+        return;
+      }
+    }
+    
+    const passResult = game.passTurn(playerId);
+    if (!passResult.error) {
+      game.players.forEach(p => {
+        io.to(p.id).emit('game_state', game.getPublicState(p.id));
+      });
+    }
+  }
+
+  setTimeout(() => {
+    const g = rooms.get(roomId);
+    if (g && g.players[g.currentTurn]?.id === playerId && player.aiControlled) {
+      makeAIMove(roomId, playerId);
+    }
+  }, 1500);
+}
+
+// =========================================
+// 🏆 نهاية اللعبة
+// =========================================
+function handleGameEnd(roomId) {
+  const game = rooms.get(roomId);
+  if (!game) return;
+
+  const winner = game.players.find(p => p.score >= game.maxScore);
+  
+  io.to(roomId).emit('game_ended', {
+    winner: winner?.name,
+    scores: game.players.map(p => ({ 
+      name: p.name, 
+      score: p.score 
+    })),
+  });
+
+  if (firebaseReady) {
+    saveMatch({
+      roomId,
+      mode: game.mode,
+      players: game.players.map(p => ({ 
+        name: p.name, 
+        score: p.score 
+      })),
+      winner: winner?.name,
+      duration: Date.now() - game.createdAt,
+      createdAt: new Date(game.createdAt).toISOString(),
+    });
+    
+    game.players.forEach(p => {
+      updateUserStats(p.name, p.id === winner?.id, p.score);
+    });
+    
+    updateLeaderboard();
+  }
+
+  setTimeout(() => closeRoom(roomId, "🏆 انتهت اللعبة"), 30000);
+}
+
+// =========================================
+// 🔌 WebSocket
 // =========================================
 io.on('connection', (socket) => {
-  console.log(`✅ لاعب متصل: ${socket.id} | إجمالي: ${io.engine.clientsCount}`);
+  console.log(`✅ لاعب متصل: ${socket.id}`);
 
   socket.on('create_room', ({ playerName, mode = "1v1" }, callback) => {
     try {
@@ -500,7 +575,7 @@ io.on('connection', (socket) => {
       playerRooms.set(socket.id, roomId);
       socket.join(roomId);
 
-      console.log(`🏠 غرفة جديدة: ${roomId} بواسطة ${playerName}`);
+      console.log(`🏠 غرفة: ${roomId}`);
 
       callback({
         success: true,
@@ -508,7 +583,6 @@ io.on('connection', (socket) => {
         game: game.getPublicState(socket.id),
       });
     } catch (err) {
-      console.error("خطأ إنشاء غرفة:", err);
       callback({ error: "فشل إنشاء الغرفة" });
     }
   });
@@ -516,18 +590,13 @@ io.on('connection', (socket) => {
   socket.on('join_room', ({ roomId, playerName }, callback) => {
     try {
       const game = rooms.get(roomId.toUpperCase());
-      if (!game) return callback({ error: "الغرفة غير موجودة أو مُغلقة" });
+      if (!game) return callback({ error: "الغرفة غير موجودة" });
       if (game.isFull()) return callback({ error: "الغرفة ممتلئة" });
-      if (game.hasPlayer(socket.id)) {
-        return callback({ error: "أنت بالفعل في الغرفة" });
-      }
 
       game.addPlayer(socket.id, playerName);
       game.lastActivity = Date.now();
       playerRooms.set(socket.id, roomId);
       socket.join(roomId);
-
-      console.log(`👤 ${playerName} انضم إلى ${roomId}`);
 
       io.to(roomId).emit('player_joined', {
         playerId: socket.id,
@@ -537,7 +606,10 @@ io.on('connection', (socket) => {
 
       if (game.isFull() && game.gameStatus === "waiting") {
         game.startRound();
-        io.to(roomId).emit('game_started', { message: "🎲 بدأت اللعبة!" });
+        io.to(roomId).emit('game_started', { 
+          message: "🎲 بدأت اللعبة!",
+          voiceChannel: roomId,
+        });
         game.players.forEach(p => {
           io.to(p.id).emit('game_state', game.getPublicState(p.id));
         });
@@ -549,8 +621,7 @@ io.on('connection', (socket) => {
         game: game.getPublicState(socket.id),
       });
     } catch (err) {
-      console.error("خطأ الانضمام:", err);
-      callback({ error: "فشل الانضمام للغرفة" });
+      callback({ error: "فشل الانضمام" });
     }
   });
 
@@ -569,39 +640,19 @@ io.on('connection', (socket) => {
 
       if (result.gameEnded) {
         io.to(roomId).emit('round_ended', game.lastAction);
-        
         if (game.gameStatus === "finished") {
-          const winner = game.players.find(p => p.score >= game.maxScore);
-          io.to(roomId).emit('game_ended', {
-            winner: winner?.name,
-            scores: game.players.map(p => ({ name: p.name, score: p.score })),
-          });
-          
-          if (firebaseReady) {
-            saveMatch({
-              roomId,
-              mode: game.mode,
-              players: game.players.map(p => ({ name: p.name, score: p.score })),
-              winner: winner?.name,
-              duration: Date.now() - game.createdAt,
-              createdAt: new Date(game.createdAt).toISOString(),
-            });
-            
-            game.players.forEach(p => {
-              updateUserStats(p.name, p.id === winner?.id, p.score);
-            });
-            
-            updateLeaderboard();
-          }
-          
-          setTimeout(() => closeRoom(roomId, "🏆 انتهت اللعبة"), 30000);
+          handleGameEnd(roomId);
+        }
+      } else {
+        const nextPlayer = game.players[game.currentTurn];
+        if (nextPlayer?.aiControlled) {
+          setTimeout(() => makeAIMove(roomId, nextPlayer.id), 1000);
         }
       }
 
       callback?.({ success: true });
     } catch (err) {
-      console.error("خطأ اللعب:", err);
-      callback?.({ error: "فشل تنفيذ الحركة" });
+      callback?.({ error: "فشل الحركة" });
     }
   });
 
@@ -639,6 +690,14 @@ io.on('connection', (socket) => {
 
       if (result.gameEnded) {
         io.to(roomId).emit('round_ended', game.lastAction);
+        if (game.gameStatus === "finished") {
+          handleGameEnd(roomId);
+        }
+      } else {
+        const nextPlayer = game.players[game.currentTurn];
+        if (nextPlayer?.aiControlled) {
+          setTimeout(() => makeAIMove(roomId, nextPlayer.id), 1000);
+        }
       }
 
       callback?.({ success: true });
@@ -652,7 +711,6 @@ io.on('connection', (socket) => {
       const game = rooms.get(roomId);
       if (!game) return callback?.({ error: "الغرفة غير موجودة" });
 
-      game.lastActivity = Date.now();
       const result = game.newRound();
       if (result.error) return callback?.({ error: result.error });
 
@@ -662,10 +720,11 @@ io.on('connection', (socket) => {
 
       callback?.({ success: true });
     } catch (err) {
-      callback?.({ error: "فشل بدء جولة جديدة" });
+      callback?.({ error: "فشل الجولة" });
     }
   });
 
+  // الدردشة
   socket.on('send_message', ({ roomId, text, type = "text" }) => {
     const game = rooms.get(roomId);
     if (!game) return;
@@ -676,9 +735,77 @@ io.on('connection', (socket) => {
     io.to(roomId).emit('chat_message', {
       playerId: socket.id,
       playerName: player.name,
-      text: text.substring(0, 100),
+      text: (text || "").substring(0, 100),
       type,
       timestamp: Date.now(),
+    });
+  });
+
+  // 🎤 إشعارات الصوت
+  socket.on('voice_joined', ({ roomId }) => {
+    const game = rooms.get(roomId);
+    if (!game) return;
+
+    const player = game.players.find(p => p.id === socket.id);
+    if (!player) return;
+
+    socket.to(roomId).emit('voice_user_joined', {
+      playerId: socket.id,
+      playerName: player.name,
+      channel: roomId,
+    });
+  });
+
+  socket.on('voice_left', ({ roomId }) => {
+    socket.to(roomId).emit('voice_user_left', {
+      playerId: socket.id,
+    });
+  });
+
+  socket.on('voice_muted', ({ roomId, muted }) => {
+    const game = rooms.get(roomId);
+    if (!game) return;
+
+    const player = game.players.find(p => p.id === socket.id);
+    if (!player) return;
+
+    socket.to(roomId).emit('voice_user_muted', {
+      playerId: socket.id,
+      playerName: player.name,
+      muted,
+    });
+  });
+
+  // إعادة اتصال
+  socket.on('reconnect_player', ({ roomId, playerName }, callback) => {
+    const game = rooms.get(roomId);
+    if (!game) return callback?.({ error: "الغرفة غير موجودة" });
+
+    const oldPlayer = game.players.find(p => 
+      p.name === playerName && !p.connected
+    );
+
+    if (!oldPlayer) return callback?.({ error: "لا يمكن إعادة الاتصال" });
+
+    const oldId = oldPlayer.id;
+    playerRooms.delete(oldId);
+    
+    oldPlayer.id = socket.id;
+    oldPlayer.connected = true;
+    playerRooms.set(socket.id, roomId);
+    socket.join(roomId);
+
+    stopAIFallback(roomId, oldId);
+    stopAIFallback(roomId, socket.id);
+
+    io.to(roomId).emit('player_reconnected', {
+      playerId: socket.id,
+      playerName,
+    });
+
+    callback?.({
+      success: true,
+      game: game.getPublicState(socket.id),
     });
   });
 
@@ -687,14 +814,14 @@ io.on('connection', (socket) => {
   });
 
   socket.on('disconnect', () => {
-    console.log(`❌ قطع اتصال: ${socket.id}`);
+    console.log(`❌ قطع: ${socket.id}`);
     const roomId = playerRooms.get(socket.id);
     if (roomId) handlePlayerLeave(socket, roomId);
   });
 });
 
 // =========================================
-// معالجة مغادرة اللاعب
+// مغادرة اللاعب
 // =========================================
 function handlePlayerLeave(socket, roomId) {
   const game = rooms.get(roomId);
@@ -707,12 +834,32 @@ function handlePlayerLeave(socket, roomId) {
 
   io.to(roomId).emit('player_left', {
     playerId: socket.id,
-    message: "أحد اللاعبين غادر الغرفة",
+    message: "أحد اللاعبين غادر",
   });
 
-  const connectedPlayers = game.players.filter(p => p.connected);
+  // إشعار الصوت
+  socket.to(roomId).emit('voice_user_left', {
+    playerId: socket.id,
+  });
+
+  const player = game.players.find(p => p.id === socket.id);
   
-  if (game.isEmpty() || connectedPlayers.length === 0) {
+  if (player && game.players.filter(p => p.connected).length > 0) {
+    console.log(`⏱️ جدولة AI Fallback لـ ${player.name}`);
+    
+    player.aiTakeoverTimer = setTimeout(() => {
+      const currentGame = rooms.get(roomId);
+      if (!currentGame) return;
+      
+      const currentPlayer = currentGame.players.find(p => p.id === socket.id);
+      if (!currentPlayer || currentPlayer.connected) return;
+      
+      startAIFallback(roomId, socket.id);
+    }, AI_TAKEOVER_DELAY);
+  }
+
+  const connectedPlayers = game.players.filter(p => p.connected);
+  if (connectedPlayers.length === 0) {
     closeRoom(roomId, "👋 غادر جميع اللاعبين");
   }
 }
@@ -724,20 +871,19 @@ const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`
   ╔═══════════════════════════════════════╗
-  ║   🎲 Domino Server v3.1              ║
+  ║   🎲 Domino Server v5.0              ║
   ║   Port: ${PORT}                          ║
-  ║   Status: ✅ Ready                    ║
   ║   Firebase: ${firebaseReady ? '✅' : '⚠️'}                      ║
-  ║   Storage: ${bucket ? '✅' : '⚠️'}                       ║
-  ║   OTA: ${OTA_ENABLED ? '✅ مفعّل' : '⏸️ معطّل'}                    ║
-  ║   Auto-Clean: ✅ مفعّل                ║
+  ║   OTA: ${OTA_ENABLED ? '✅' : '⏸️'}                        ║
+  ║   AI Fallback: ✅                     ║
+  ║   Agora Voice: ✅                     ║
   ╚═══════════════════════════════════════╝
   `);
 });
 
 process.on('uncaughtException', (err) => {
-  console.error('❌ خطأ غير متوقع:', err);
+  console.error('❌ خطأ:', err);
 });
 process.on('unhandledRejection', (err) => {
-  console.error('❌ رفض غير معالج:', err);
+  console.error('❌ رفض:', err);
 });
