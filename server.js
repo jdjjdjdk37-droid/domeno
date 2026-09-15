@@ -1,6 +1,6 @@
 // ==============================================
-// خادم لعبة الدومينو - Railway Ready v5.0
-// مع Agora (مكالمات صوتية) + Firebase + AI Fallback
+// خادم لعبة الدومينو - Railway Ready v5.5 (Yalla Ludo Style)
+// مع Agora (مكالمات صوتية) + Firebase + Friends & Invites + AI Fallback
 // ==============================================
 require('dotenv').config();
 const express = require('express');
@@ -73,10 +73,11 @@ app.use(express.json());
 app.use('/downloads', express.static(path.join(__dirname, 'public/downloads')));
 
 // =========================================
-// تخزين الغرف
+// تخزين الغرف والمستخدمين المتصلين
 // =========================================
 const rooms = new Map();
 const playerRooms = new Map();
+const onlineUsers = new Map(); // map userId/playerName -> socket.id
 
 // إعدادات
 const AI_TAKEOVER_DELAY = 30000;
@@ -86,12 +87,12 @@ const TURN_TIMEOUT = 30000;
 const OTA_ENABLED = false;
 
 const LATEST_VERSION = {
-  versionCode: 3,
-  versionName: "2.3.0",
-  apkUrl: `${process.env.PUBLIC_URL || 'https://domino-server-production-e9af.up.railway.app'}/downloads/domino-v2.3.0.apk`,
-  changelog: "🎉 جديد:\n• مكالمات صوتية (Agora)\n• إصلاح عرض القطع\n• تحسين الثيم",
+  versionCode: 4,
+  versionName: "2.4.0",
+  apkUrl: `${process.env.PUBLIC_URL || 'https://domino-server-production-e9af.up.railway.app'}/downloads/domino-v2.4.0.apk`,
+  changelog: "🎉 جديد:\n• نظام دعوة الأصدقاء اللحظي (Firebase & Sockets)\n• دعم نمط 2 ضد 2 للفرق\n• تحسين محاذاة الكاميرا والأحجار الأفعوانية\n• مكالمات صوتية عالية الدقة (Agora)",
   isMandatory: false,
-  releaseDate: "2026-09-14",
+  releaseDate: "2026-09-16",
   minSupportedVersion: 1,
 };
 
@@ -209,11 +210,12 @@ setInterval(() => {
 
 app.get('/', (req, res) => {
   res.json({
-    name: "🎲 Domino Server",
+    name: "🎲 Domino Server - Yalla Ludo Style",
     status: "online",
-    version: "5.0.0",
+    version: "5.5.0",
     activeRooms: rooms.size,
     activePlayers: playerRooms.size,
+    onlineUsers: onlineUsers.size,
     uptime: Math.floor(process.uptime()) + "s",
     otaEnabled: OTA_ENABLED,
     firebaseReady: firebaseReady,
@@ -269,6 +271,7 @@ app.get('/api/config', (req, res) => {
       avatars: true,
       chat: true,
       leaderboard: true,
+      friendInvites: true,
     },
     agora: {
       appId: AGORA_APP_ID,
@@ -298,7 +301,7 @@ app.get('/api/check-update', (req, res) => {
   }
 
   const clientVersion = parseInt(req.query.versionCode) || 0;
-  const apkPath = path.join(__dirname, 'public/downloads/domino-v2.3.0.apk');
+  const apkPath = path.join(__dirname, 'public/downloads/domino-v2.4.0.apk');
 
   if (!fs.existsSync(apkPath)) {
     return res.json({ updateAvailable: false });
@@ -565,6 +568,43 @@ function handleGameEnd(roomId) {
 io.on('connection', (socket) => {
   console.log(`✅ لاعب متصل: ${socket.id}`);
 
+  // تسجل اللاعب بحالته المتصلة
+  socket.on('user_online', ({ userName }) => {
+    if (userName) {
+      onlineUsers.set(userName, socket.id);
+      socket.userName = userName;
+      console.log(`👤 تسجيل دخول اللاعب: ${userName}`);
+    }
+  });
+
+  // 📩 إرسال دعوة لصديق
+  socket.on('invite_friend', ({ targetUserName, roomId, mode }) => {
+    const targetSocketId = onlineUsers.get(targetUserName);
+    if (targetSocketId) {
+      io.to(targetSocketId).emit('receive_room_invite', {
+        fromUser: socket.userName || "صديق",
+        roomId,
+        mode,
+        timestamp: Date.now()
+      });
+      console.log(`📩 تم إرسال دعوة من ${socket.userName} إلى ${targetUserName}`);
+    } else {
+      socket.emit('invite_failed', { message: "الصديق غير متصل حالياً" });
+    }
+  });
+
+  // 🤝 الرد على الدعوة (قبول / رفض)
+  socket.on('respond_invite', ({ roomId, accept, inviterName }) => {
+    const inviterSocketId = onlineUsers.get(inviterName);
+    if (inviterSocketId) {
+      io.to(inviterSocketId).emit('invite_response', {
+        fromUser: socket.userName,
+        accept,
+        roomId
+      });
+    }
+  });
+
   socket.on('create_room', ({ playerName, mode = "1v1" }, callback) => {
     try {
       const roomId = uuidv4().slice(0, 6).toUpperCase();
@@ -575,7 +615,7 @@ io.on('connection', (socket) => {
       playerRooms.set(socket.id, roomId);
       socket.join(roomId);
 
-      console.log(`🏠 غرفة: ${roomId}`);
+      console.log(`🏠 غرفة جديدة [${mode}]: ${roomId}`);
 
       callback({
         success: true,
@@ -724,7 +764,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // الدردشة
+  // الدردشة المباشرة والإيموجيات
   socket.on('send_message', ({ roomId, text, type = "text" }) => {
     const game = rooms.get(roomId);
     if (!game) return;
@@ -741,7 +781,7 @@ io.on('connection', (socket) => {
     });
   });
 
-  // 🎤 إشعارات الصوت
+  // 🎤 إشعارات الصوت اللحظية (Speaking Waves)
   socket.on('voice_joined', ({ roomId }) => {
     const game = rooms.get(roomId);
     if (!game) return;
@@ -815,6 +855,9 @@ io.on('connection', (socket) => {
 
   socket.on('disconnect', () => {
     console.log(`❌ قطع: ${socket.id}`);
+    if (socket.userName) {
+      onlineUsers.delete(socket.userName);
+    }
     const roomId = playerRooms.get(socket.id);
     if (roomId) handlePlayerLeave(socket, roomId);
   });
@@ -837,7 +880,6 @@ function handlePlayerLeave(socket, roomId) {
     message: "أحد اللاعبين غادر",
   });
 
-  // إشعار الصوت
   socket.to(roomId).emit('voice_user_left', {
     playerId: socket.id,
   });
@@ -871,12 +913,13 @@ const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`
   ╔═══════════════════════════════════════╗
-  ║   🎲 Domino Server v5.0              ║
+  ║   🎲 Domino Server v5.5 (Yalla Ludo) ║
   ║   Port: ${PORT}                          ║
   ║   Firebase: ${firebaseReady ? '✅' : '⚠️'}                      ║
   ║   OTA: ${OTA_ENABLED ? '✅' : '⏸️'}                        ║
   ║   AI Fallback: ✅                     ║
   ║   Agora Voice: ✅                     ║
+  ║   Friends & Invites: ✅               ║
   ╚═══════════════════════════════════════╝
   `);
 });
